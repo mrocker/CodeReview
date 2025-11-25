@@ -1,0 +1,30 @@
+# Example: How to use the reusable AI Code Review workflow
+# Copy this file to your project's .github/workflows/ directory
+
+name: Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+      - master
+
+jobs:
+  ai-review:
+    # Replace 'your-org/CodeReview' with your actual repository path
+    uses: your-org/CodeReview/.github/workflows/ai-code-review.yml@main
+    secrets:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    # All inputs are optional, below are the defaults
+    with:
+      python-version: '3.12'
+      min-score: 7
+      max-files: 20
+      max-lines: 500
+      auto-merge: true
+      merge-method: 'squash'
+      language: 'zh'
+      gemini-model: 'gemini-2.0-flash'
+      run-security-scan: true
+      run-code-quality: true

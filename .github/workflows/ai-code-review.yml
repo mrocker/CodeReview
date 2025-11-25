@@ -1,0 +1,512 @@
+# Reusable AI Code Review Workflow
+# Usage: 在其他项目中通过 workflow_call 调用
+#
+# Example:
+#   jobs:
+#     review:
+#       uses: your-org/CodeReview/.github/workflows/ai-code-review.yml@main
+#       secrets:
+#         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+name: AI Code Review
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: 'Python version to use'
+        required: false
+        type: string
+        default: '3.12'
+      min-score:
+        description: 'Minimum score for auto-approval (0-10)'
+        required: false
+        type: number
+        default: 7
+      max-files:
+        description: 'Max files changed for auto-merge'
+        required: false
+        type: number
+        default: 20
+      max-lines:
+        description: 'Max lines changed for auto-merge'
+        required: false
+        type: number
+        default: 500
+      auto-merge:
+        description: 'Enable auto-merge for approved PRs'
+        required: false
+        type: boolean
+        default: true
+      merge-method:
+        description: 'Merge method (merge, squash, rebase)'
+        required: false
+        type: string
+        default: 'squash'
+      language:
+        description: 'Review language (zh, en)'
+        required: false
+        type: string
+        default: 'zh'
+      gemini-model:
+        description: 'Gemini model to use'
+        required: false
+        type: string
+        default: 'gemini-2.0-flash'
+      run-security-scan:
+        description: 'Run security vulnerability scan'
+        required: false
+        type: boolean
+        default: true
+      run-code-quality:
+        description: 'Run code quality checks'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      GEMINI_API_KEY:
+        description: 'Google Gemini API Key'
+        required: true
+    outputs:
+      score:
+        description: 'AI review score (0-10)'
+        value: ${{ jobs.ai-code-review.outputs.score }}
+      approved:
+        description: 'Whether PR is approved'
+        value: ${{ jobs.ai-code-review.outputs.approved }}
+      merged:
+        description: 'Whether PR was auto-merged'
+        value: ${{ jobs.auto-approve-and-merge.outputs.merged }}
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: write
+
+jobs:
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    if: ${{ inputs.run-code-quality }}
+    outputs:
+      black-status: ${{ steps.black.outcome }}
+      ruff-status: ${{ steps.ruff.outcome }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install black ruff
+
+      - name: Run Black (code formatting check)
+        id: black
+        run: |
+          black --check . || echo "black_failed=true" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Run Ruff (fast linter)
+        id: ruff
+        run: |
+          ruff check . --output-format=github || echo "ruff_failed=true" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+  security-scan:
+    name: Security Vulnerability Scan
+    runs-on: ubuntu-latest
+    if: ${{ inputs.run-security-scan }}
+    outputs:
+      bandit-status: ${{ steps.bandit.outcome }}
+      safety-status: ${{ steps.safety.outcome }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install security tools
+        run: |
+          pip install bandit safety
+
+      - name: Run Bandit (security linter)
+        id: bandit
+        run: |
+          bandit -r . -f json -o bandit-report.json || echo "bandit_failed=true" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Run Safety (dependency vulnerabilities)
+        id: safety
+        run: |
+          safety check --json || echo "safety_failed=true" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Upload security report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: bandit-report.json
+
+  ai-code-review:
+    name: AI Code Review
+    runs-on: ubuntu-latest
+    needs: [code-quality, security-scan]
+    if: |
+      always() &&
+      (needs.code-quality.result == 'success' || needs.code-quality.result == 'skipped') &&
+      (needs.security-scan.result == 'success' || needs.security-scan.result == 'skipped')
+    outputs:
+      score: ${{ steps.ai-review.outputs.score }}
+      approved: ${{ steps.ai-review.outputs.approved }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        id: diff
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          DIFF=$(git diff origin/${{ github.base_ref }}...HEAD)
+          echo "$DIFF" > pr-diff.txt
+          LINES_CHANGED=$(echo "$DIFF" | wc -l)
+          echo "lines_changed=$LINES_CHANGED" >> $GITHUB_OUTPUT
+
+      - name: Install Google Generative AI SDK
+        run: |
+          pip install google-generativeai
+
+      - name: AI Code Review
+        id: ai-review
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MIN_SCORE: ${{ inputs.min-score }}
+          REVIEW_LANGUAGE: ${{ inputs.language }}
+          GEMINI_MODEL: ${{ inputs.gemini-model }}
+        run: |
+          python3 << 'EOF'
+          import os
+          import json
+          import sys
+          import google.generativeai as genai
+
+          # Configure Gemini API
+          genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
+
+          min_score = int(os.environ.get('MIN_SCORE', '7'))
+          language = os.environ.get('REVIEW_LANGUAGE', 'zh')
+          model_name = os.environ.get('GEMINI_MODEL', 'gemini-2.0-flash')
+
+          with open('pr-diff.txt', 'r') as f:
+              diff = f.read()
+
+          # Truncate if too large
+          if len(diff) > 200000:
+              diff = diff[:200000] + "\n... (truncated)"
+
+          # Select prompt based on language
+          if language == 'zh':
+              prompt = f"""你是一个专业的代码审查专家。请审查以下 Pull Request 的代码变更：
+
+          {diff}
+
+          请从以下维度评估（每项 0-10 分）：
+          1. 代码质量（可读性、复杂度、命名）
+          2. 安全性（潜在漏洞、输入验证）
+          3. 性能（算法效率、资源使用）
+          4. 测试覆盖（是否有相应测试）
+          5. 最佳实践（是否遵循项目规范）
+
+          返回 JSON 格式（只返回 JSON，不要其他内容）：
+          {{
+            "overall_score": 总分（0-10，数字类型），
+            "quality": 分数（数字类型）,
+            "security": 分数（数字类型）,
+            "performance": 分数（数字类型）,
+            "testing": 分数（数字类型）,
+            "best_practices": 分数（数字类型）,
+            "approved": true/false（布尔类型，总分>={min_score}则批准）,
+            "summary": "简短总结（中文字符串）",
+            "issues": ["问题1", "问题2", ...]（字符串数组）,
+            "suggestions": ["建议1", "建议2", ...]（字符串数组）
+          }}
+          """
+          else:
+              prompt = f"""You are a professional code review expert. Please review the following Pull Request changes:
+
+          {diff}
+
+          Evaluate from these dimensions (0-10 for each):
+          1. Code Quality (readability, complexity, naming)
+          2. Security (potential vulnerabilities, input validation)
+          3. Performance (algorithm efficiency, resource usage)
+          4. Test Coverage (whether there are corresponding tests)
+          5. Best Practices (following project conventions)
+
+          Return JSON format (only JSON, no other content):
+          {{
+            "overall_score": total score (0-10, number),
+            "quality": score (number),
+            "security": score (number),
+            "performance": score (number),
+            "testing": score (number),
+            "best_practices": score (number),
+            "approved": true/false (boolean, approve if score >= {min_score}),
+            "summary": "brief summary (string)",
+            "issues": ["issue1", "issue2", ...] (string array),
+            "suggestions": ["suggestion1", "suggestion2", ...] (string array)
+          }}
+          """
+
+          try:
+              model = genai.GenerativeModel(
+                  model_name=model_name,
+                  generation_config={
+                      'temperature': 0.3,
+                      'top_p': 0.95,
+                      'top_k': 40,
+                      'max_output_tokens': 8192,
+                      'response_mime_type': 'application/json',
+                  }
+              )
+
+              response = model.generate_content(prompt)
+              result = json.loads(response.text)
+
+              print(f"AI Review Score: {result['overall_score']}/10")
+              print(f"Approved: {result['approved']}")
+              print(f"Model: {model_name}")
+
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                  f.write(f"score={result['overall_score']}\n")
+                  f.write(f"approved={str(result['approved']).lower()}\n")
+
+              with open('ai-review-report.json', 'w') as f:
+                  json.dump(result, f, indent=2, ensure_ascii=False)
+
+          except json.JSONDecodeError as e:
+              print(f"JSON parsing failed: {e}")
+              print(f"Raw response: {response.text}")
+              try:
+                  import re
+                  json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
+                  if json_match:
+                      result = json.loads(json_match.group())
+                      with open('ai-review-report.json', 'w') as f:
+                          json.dump(result, f, indent=2, ensure_ascii=False)
+                      with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                          f.write(f"score={result['overall_score']}\n")
+                          f.write(f"approved={str(result['approved']).lower()}\n")
+                  else:
+                      raise
+              except:
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                      f.write("score=0\n")
+                      f.write("approved=false\n")
+                  sys.exit(1)
+          except Exception as e:
+              print(f"AI Review failed: {e}")
+              import traceback
+              traceback.print_exc()
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                  f.write("score=0\n")
+                  f.write("approved=false\n")
+              sys.exit(1)
+          EOF
+
+      - name: Upload AI review report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-report
+          path: ai-review-report.json
+
+      - name: Comment AI review on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let report;
+            try {
+              report = JSON.parse(fs.readFileSync('ai-review-report.json', 'utf8'));
+            } catch (e) {
+              console.log('No review report found');
+              return;
+            }
+
+            const lang = '${{ inputs.language }}';
+            const labels = lang === 'zh' ? {
+              title: '🤖 AI 代码审查报告',
+              score: '综合评分',
+              details: '详细评分',
+              quality: '代码质量',
+              security: '安全性',
+              performance: '性能',
+              testing: '测试覆盖',
+              bestPractices: '最佳实践',
+              summary: '总结',
+              issues: '⚠️ 发现的问题',
+              suggestions: '💡 建议',
+              approved: '✅ **此 PR 已通过 AI 审查，可以自动合并**',
+              needsReview: '⚠️ **此 PR 需要人工审查**'
+            } : {
+              title: '🤖 AI Code Review Report',
+              score: 'Overall Score',
+              details: 'Detailed Scores',
+              quality: 'Code Quality',
+              security: 'Security',
+              performance: 'Performance',
+              testing: 'Testing',
+              bestPractices: 'Best Practices',
+              summary: 'Summary',
+              issues: '⚠️ Issues Found',
+              suggestions: '💡 Suggestions',
+              approved: '✅ **This PR is approved by AI and ready for auto-merge**',
+              needsReview: '⚠️ **This PR needs manual review**'
+            };
+
+            const body = `## ${labels.title}
+
+            **${labels.score}:** ${report.overall_score}/10 ${report.approved ? '✅' : '⚠️'}
+
+            ### ${labels.details}
+            - ${labels.quality}: ${report.quality}/10
+            - ${labels.security}: ${report.security}/10
+            - ${labels.performance}: ${report.performance}/10
+            - ${labels.testing}: ${report.testing}/10
+            - ${labels.bestPractices}: ${report.best_practices}/10
+
+            ### ${labels.summary}
+            ${report.summary}
+
+            ${report.issues && report.issues.length > 0 ? `### ${labels.issues}\n${report.issues.map(i => `- ${i}`).join('\n')}` : ''}
+
+            ${report.suggestions && report.suggestions.length > 0 ? `### ${labels.suggestions}\n${report.suggestions.map(s => `- ${s}`).join('\n')}` : ''}
+
+            ---
+            ${report.approved ? labels.approved : labels.needsReview}
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+  auto-approve-and-merge:
+    name: Auto Approve and Merge
+    runs-on: ubuntu-latest
+    needs: [code-quality, security-scan, ai-code-review]
+    if: |
+      always() &&
+      inputs.auto-merge &&
+      needs.ai-code-review.outputs.approved == 'true'
+    outputs:
+      merged: ${{ steps.merge.outputs.merged }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check PR size
+        id: pr-size
+        env:
+          MAX_FILES: ${{ inputs.max-files }}
+          MAX_LINES: ${{ inputs.max-lines }}
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          FILES_CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | wc -l)
+          LINES_CHANGED=$(git diff origin/${{ github.base_ref }}...HEAD | wc -l)
+
+          echo "files_changed=$FILES_CHANGED" >> $GITHUB_OUTPUT
+          echo "lines_changed=$LINES_CHANGED" >> $GITHUB_OUTPUT
+
+          if [ $FILES_CHANGED -gt $MAX_FILES ] || [ $LINES_CHANGED -gt $MAX_LINES ]; then
+            echo "too_large=true" >> $GITHUB_OUTPUT
+            echo "⚠️ PR too large for auto-merge: $FILES_CHANGED files, $LINES_CHANGED lines"
+          else
+            echo "too_large=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Auto approve PR
+        if: steps.pr-size.outputs.too_large == 'false'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              event: 'APPROVE',
+              body: '✅ Auto-approved by AI code review system\n\n- AI review score: ${{ needs.ai-code-review.outputs.score }}/10\n- Security scan: ${{ needs.security-scan.result }}\n- Code quality: ${{ needs.code-quality.result }}'
+            });
+
+      - name: Merge PR
+        id: merge
+        if: steps.pr-size.outputs.too_large == 'false'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            try {
+              await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                merge_method: '${{ inputs.merge-method }}',
+                commit_title: `${{ github.event.pull_request.title }} (#${{ github.event.pull_request.number }})`,
+                commit_message: 'Auto-merged by AI code review system'
+              });
+              core.setOutput('merged', 'true');
+            } catch (e) {
+              console.log('Merge failed:', e.message);
+              core.setOutput('merged', 'false');
+            }
+
+      - name: Comment merge status
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tooLarge = '${{ steps.pr-size.outputs.too_large }}' === 'true';
+            const merged = '${{ steps.merge.outputs.merged }}' === 'true';
+            const lang = '${{ inputs.language }}';
+
+            let body;
+            if (tooLarge) {
+              body = lang === 'zh'
+                ? `⚠️ **自动合并已跳过**: PR 变更过大 (${{ steps.pr-size.outputs.files_changed }} 文件, ${{ steps.pr-size.outputs.lines_changed }} 行)。请申请人工审查。`
+                : `⚠️ **Auto-merge skipped**: PR is too large (${{ steps.pr-size.outputs.files_changed }} files, ${{ steps.pr-size.outputs.lines_changed }} lines). Please request manual review.`;
+            } else if (merged) {
+              body = lang === 'zh'
+                ? '✅ **PR 已自动合并成功！**'
+                : '✅ **PR auto-merged successfully!**';
+            } else {
+              body = lang === 'zh'
+                ? '⚠️ **自动合并失败，请人工处理**'
+                : '⚠️ **Auto-merge failed, please merge manually**';
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });

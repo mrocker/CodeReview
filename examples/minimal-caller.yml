@@ -1,0 +1,14 @@
+# Minimal example: Just the essentials
+# Copy to your project's .github/workflows/code-review.yml
+
+name: Code Review
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  review:
+    uses: your-org/CodeReview/.github/workflows/ai-code-review.yml@main
+    secrets:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
