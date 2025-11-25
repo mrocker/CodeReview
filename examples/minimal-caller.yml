@@ -11,4 +11,4 @@ jobs:
   review:
     uses: your-org/CodeReview/.github/workflows/ai-code-review.yml@main
     secrets:
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      AI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

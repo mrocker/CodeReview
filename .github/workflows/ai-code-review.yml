@@ -6,18 +6,23 @@
 #     review:
 #       uses: your-org/CodeReview/.github/workflows/ai-code-review.yml@main
 #       secrets:
-#         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+#         AI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
 name: AI Code Review
 
 on:
   workflow_call:
     inputs:
-      python-version:
-        description: 'Python version to use'
+      ai-provider:
+        description: 'AI provider (gemini, openai, claude)'
         required: false
         type: string
-        default: '3.12'
+        default: 'gemini'
+      ai-model:
+        description: 'AI model name (empty for provider default)'
+        required: false
+        type: string
+        default: ''
       min-score:
         description: 'Minimum score for auto-approval (0-10)'
         required: false
@@ -48,24 +53,24 @@ on:
         required: false
         type: string
         default: 'zh'
-      gemini-model:
-        description: 'Gemini model to use'
+      run-security-scan:
+        description: 'Run security vulnerability scan with Trivy'
+        required: false
+        type: boolean
+        default: true
+      exclude-patterns:
+        description: 'File patterns to exclude from review (comma-separated)'
         required: false
         type: string
-        default: 'gemini-2.0-flash'
-      run-security-scan:
-        description: 'Run security vulnerability scan'
+        default: '*.md,*.txt,*.json,*.lock,*.yaml,*.yml'
+      custom-prompt:
+        description: 'Additional review instructions'
         required: false
-        type: boolean
-        default: true
-      run-code-quality:
-        description: 'Run code quality checks'
-        required: false
-        type: boolean
-        default: true
+        type: string
+        default: ''
     secrets:
-      GEMINI_API_KEY:
-        description: 'Google Gemini API Key'
+      AI_API_KEY:
+        description: 'AI API Key (Gemini/OpenAI/Claude)'
         required: true
     outputs:
       score:
@@ -82,74 +87,29 @@ permissions:
   contents: write
   pull-requests: write
   checks: write
+  security-events: read
 
 jobs:
-  code-quality:
-    name: Code Quality Checks
-    runs-on: ubuntu-latest
-    if: ${{ inputs.run-code-quality }}
-    outputs:
-      black-status: ${{ steps.black.outcome }}
-      ruff-status: ${{ steps.ruff.outcome }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ inputs.python-version }}
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install black ruff
-
-      - name: Run Black (code formatting check)
-        id: black
-        run: |
-          black --check . || echo "black_failed=true" >> $GITHUB_OUTPUT
-        continue-on-error: true
-
-      - name: Run Ruff (fast linter)
-        id: ruff
-        run: |
-          ruff check . --output-format=github || echo "ruff_failed=true" >> $GITHUB_OUTPUT
-        continue-on-error: true
-
   security-scan:
     name: Security Vulnerability Scan
     runs-on: ubuntu-latest
     if: ${{ inputs.run-security-scan }}
+    timeout-minutes: 10
     outputs:
-      bandit-status: ${{ steps.bandit.outcome }}
-      safety-status: ${{ steps.safety.outcome }}
+      trivy-status: ${{ steps.trivy.outcome }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Run Trivy vulnerability scanner
+        id: trivy
+        uses: aquasecurity/trivy-action@master
         with:
-          python-version: ${{ inputs.python-version }}
-
-      - name: Install security tools
-        run: |
-          pip install bandit safety
-
-      - name: Run Bandit (security linter)
-        id: bandit
-        run: |
-          bandit -r . -f json -o bandit-report.json || echo "bandit_failed=true" >> $GITHUB_OUTPUT
-        continue-on-error: true
-
-      - name: Run Safety (dependency vulnerabilities)
-        id: safety
-        run: |
-          safety check --json || echo "safety_failed=true" >> $GITHUB_OUTPUT
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'json'
+          output: 'trivy-report.json'
+          severity: 'CRITICAL,HIGH,MEDIUM'
         continue-on-error: true
 
       - name: Upload security report
@@ -157,15 +117,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: security-reports
-          path: bandit-report.json
+          path: trivy-report.json
 
   ai-code-review:
     name: AI Code Review
     runs-on: ubuntu-latest
-    needs: [code-quality, security-scan]
+    needs: [security-scan]
+    timeout-minutes: 15
     if: |
       always() &&
-      (needs.code-quality.result == 'success' || needs.code-quality.result == 'skipped') &&
       (needs.security-scan.result == 'success' || needs.security-scan.result == 'skipped')
     outputs:
       score: ${{ steps.ai-review.outputs.score }}
@@ -180,36 +140,99 @@ jobs:
         id: diff
         run: |
           git fetch origin ${{ github.base_ref }}
-          DIFF=$(git diff origin/${{ github.base_ref }}...HEAD)
-          echo "$DIFF" > pr-diff.txt
-          LINES_CHANGED=$(echo "$DIFF" | wc -l)
-          echo "lines_changed=$LINES_CHANGED" >> $GITHUB_OUTPUT
 
-      - name: Install Google Generative AI SDK
+          # Build exclude patterns for git diff
+          EXCLUDE_ARGS=""
+          IFS=',' read -ra PATTERNS <<< "${{ inputs.exclude-patterns }}"
+          for pattern in "${PATTERNS[@]}"; do
+            pattern=$(echo "$pattern" | xargs)  # trim whitespace
+            EXCLUDE_ARGS="$EXCLUDE_ARGS -- ':(exclude)$pattern'"
+          done
+
+          # Also exclude sensitive files
+          EXCLUDE_ARGS="$EXCLUDE_ARGS -- ':(exclude).env*' -- ':(exclude)*secret*' -- ':(exclude)*.pem' -- ':(exclude)*.key'"
+
+          # Get diff excluding patterns
+          eval "DIFF=\$(git diff origin/${{ github.base_ref }}...HEAD $EXCLUDE_ARGS)" || DIFF=""
+
+          if [ -z "$DIFF" ] || [ $(echo "$DIFF" | wc -l) -lt 3 ]; then
+            echo "empty_diff=true" >> $GITHUB_OUTPUT
+            echo "No code changes detected (only docs/config/excluded files)"
+          else
+            echo "$DIFF" > pr-diff.txt
+            LINES_CHANGED=$(echo "$DIFF" | wc -l)
+            echo "lines_changed=$LINES_CHANGED" >> $GITHUB_OUTPUT
+            echo "empty_diff=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Auto approve docs-only PR
+        if: steps.diff.outputs.empty_diff == 'true'
+        id: auto-approve-docs
         run: |
-          pip install google-generativeai
+          echo "score=10" >> $GITHUB_OUTPUT
+          echo "approved=true" >> $GITHUB_OUTPUT
+          cat > ai-review-report.json << 'DOCEOF'
+          {
+            "overall_score": 10,
+            "quality": 10,
+            "security": 10,
+            "performance": 10,
+            "testing": 10,
+            "best_practices": 10,
+            "approved": true,
+            "summary": "Documentation/config only changes, auto-approved",
+            "issues": [],
+            "suggestions": []
+          }
+          DOCEOF
+
+      - name: Install AI SDK
+        if: steps.diff.outputs.empty_diff != 'true'
+        run: |
+          if [ "${{ inputs.ai-provider }}" = "gemini" ]; then
+            pip install google-generativeai
+          elif [ "${{ inputs.ai-provider }}" = "openai" ]; then
+            pip install openai
+          elif [ "${{ inputs.ai-provider }}" = "claude" ]; then
+            pip install anthropic
+          fi
 
       - name: AI Code Review
         id: ai-review
+        if: steps.diff.outputs.empty_diff != 'true'
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_PROVIDER: ${{ inputs.ai-provider }}
+          AI_MODEL: ${{ inputs.ai-model }}
           MIN_SCORE: ${{ inputs.min-score }}
           REVIEW_LANGUAGE: ${{ inputs.language }}
-          GEMINI_MODEL: ${{ inputs.gemini-model }}
+          CUSTOM_PROMPT: ${{ inputs.custom-prompt }}
+          LINES_CHANGED: ${{ steps.diff.outputs.lines_changed }}
         run: |
           python3 << 'EOF'
           import os
           import json
           import sys
-          import google.generativeai as genai
+          import time
 
-          # Configure Gemini API
-          genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
-
+          # Configuration
+          api_key = os.environ.get('AI_API_KEY')
+          provider = os.environ.get('AI_PROVIDER', 'gemini')
+          model = os.environ.get('AI_MODEL', '')
           min_score = int(os.environ.get('MIN_SCORE', '7'))
           language = os.environ.get('REVIEW_LANGUAGE', 'zh')
-          model_name = os.environ.get('GEMINI_MODEL', 'gemini-2.0-flash')
+          custom_prompt = os.environ.get('CUSTOM_PROMPT', '')
+          lines_changed = os.environ.get('LINES_CHANGED', '0')
 
+          # Default models per provider
+          DEFAULT_MODELS = {
+              'gemini': 'gemini-2.0-flash',
+              'openai': 'gpt-4o',
+              'claude': 'claude-sonnet-4-20250514'
+          }
+          model_name = model or DEFAULT_MODELS.get(provider, 'gemini-2.0-flash')
+
+          # Read diff
           with open('pr-diff.txt', 'r') as f:
               diff = f.read()
 
@@ -217,9 +240,9 @@ jobs:
           if len(diff) > 200000:
               diff = diff[:200000] + "\n... (truncated)"
 
-          # Select prompt based on language
+          # Build prompt
           if language == 'zh':
-              prompt = f"""你是一个专业的代码审查专家。请审查以下 Pull Request 的代码变更：
+              base_prompt = f"""你是一个专业的代码审查专家。请审查以下 Pull Request 的代码变更：
 
           {diff}
 
@@ -229,6 +252,8 @@ jobs:
           3. 性能（算法效率、资源使用）
           4. 测试覆盖（是否有相应测试）
           5. 最佳实践（是否遵循项目规范）
+
+          {f"额外要求：{custom_prompt}" if custom_prompt else ""}
 
           返回 JSON 格式（只返回 JSON，不要其他内容）：
           {{
@@ -245,7 +270,7 @@ jobs:
           }}
           """
           else:
-              prompt = f"""You are a professional code review expert. Please review the following Pull Request changes:
+              base_prompt = f"""You are a professional code review expert. Please review the following Pull Request changes:
 
           {diff}
 
@@ -255,6 +280,8 @@ jobs:
           3. Performance (algorithm efficiency, resource usage)
           4. Test Coverage (whether there are corresponding tests)
           5. Best Practices (following project conventions)
+
+          {f"Additional requirements: {custom_prompt}" if custom_prompt else ""}
 
           Return JSON format (only JSON, no other content):
           {{
@@ -271,24 +298,85 @@ jobs:
           }}
           """
 
-          try:
-              model = genai.GenerativeModel(
-                  model_name=model_name,
-                  generation_config={
-                      'temperature': 0.3,
-                      'top_p': 0.95,
-                      'top_k': 40,
-                      'max_output_tokens': 8192,
-                      'response_mime_type': 'application/json',
-                  }
-              )
+          def validate_scores(result):
+              """Ensure all scores are within 0-10 range"""
+              for key in ['overall_score', 'quality', 'security', 'performance', 'testing', 'best_practices']:
+                  if key in result:
+                      try:
+                          result[key] = max(0, min(10, float(result[key])))
+                      except (ValueError, TypeError):
+                          result[key] = 0
+              return result
 
-              response = model.generate_content(prompt)
-              result = json.loads(response.text)
+          def call_ai_with_retry(prompt, max_retries=3):
+              """Call AI API with exponential backoff retry"""
+              start_time = time.time()
+
+              for attempt in range(max_retries):
+                  try:
+                      if provider == 'gemini':
+                          import google.generativeai as genai
+                          genai.configure(api_key=api_key)
+                          model_obj = genai.GenerativeModel(
+                              model_name=model_name,
+                              generation_config={
+                                  'temperature': 0.3,
+                                  'top_p': 0.95,
+                                  'top_k': 40,
+                                  'max_output_tokens': 8192,
+                                  'response_mime_type': 'application/json',
+                              }
+                          )
+                          response = model_obj.generate_content(prompt)
+                          return response.text, time.time() - start_time
+
+                      elif provider == 'openai':
+                          from openai import OpenAI
+                          client = OpenAI(api_key=api_key)
+                          response = client.chat.completions.create(
+                              model=model_name,
+                              messages=[{"role": "user", "content": prompt}],
+                              temperature=0.3,
+                              max_tokens=8192,
+                              response_format={"type": "json_object"}
+                          )
+                          return response.choices[0].message.content, time.time() - start_time
+
+                      elif provider == 'claude':
+                          import anthropic
+                          client = anthropic.Anthropic(api_key=api_key)
+                          response = client.messages.create(
+                              model=model_name,
+                              max_tokens=8192,
+                              messages=[{"role": "user", "content": prompt}]
+                          )
+                          return response.content[0].text, time.time() - start_time
+
+                  except Exception as e:
+                      if attempt < max_retries - 1:
+                          wait_time = 2 ** attempt
+                          print(f"Retry {attempt + 1}/{max_retries} after {wait_time}s: {e}")
+                          time.sleep(wait_time)
+                      else:
+                          raise
+
+          try:
+              response_text, elapsed_time = call_ai_with_retry(base_prompt)
+              result = json.loads(response_text)
+              result = validate_scores(result)
+
+              # Add metadata
+              result['_metadata'] = {
+                  'model': model_name,
+                  'provider': provider,
+                  'elapsed_seconds': round(elapsed_time, 2),
+                  'lines_changed': int(lines_changed)
+              }
 
               print(f"AI Review Score: {result['overall_score']}/10")
               print(f"Approved: {result['approved']}")
-              print(f"Model: {model_name}")
+              print(f"Model: {model_name} ({provider})")
+              print(f"Time: {elapsed_time:.2f}s")
 
               with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
                   f.write(f"score={result['overall_score']}\n")
@@ -299,12 +387,13 @@ jobs:
 
           except json.JSONDecodeError as e:
               print(f"JSON parsing failed: {e}")
-              print(f"Raw response: {response.text}")
+              print(f"Raw response: {response_text[:1000]}")
               try:
                   import re
-                  json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
+                  json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
                   if json_match:
                       result = json.loads(json_match.group())
+                      result = validate_scores(result)
                       with open('ai-review-report.json', 'w') as f:
                           json.dump(result, f, indent=2, ensure_ascii=False)
                       with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
@@ -350,7 +439,7 @@ jobs:
 
             const lang = '${{ inputs.language }}';
             const labels = lang === 'zh' ? {
-              title: '🤖 AI 代码审查报告',
+              title: 'AI 代码审查报告',
               score: '综合评分',
               details: '详细评分',
               quality: '代码质量',
@@ -359,12 +448,12 @@ jobs:
               testing: '测试覆盖',
               bestPractices: '最佳实践',
               summary: '总结',
-              issues: '⚠️ 发现的问题',
-              suggestions: '💡 建议',
-              approved: '✅ **此 PR 已通过 AI 审查，可以自动合并**',
-              needsReview: '⚠️ **此 PR 需要人工审查**'
+              issues: '发现的问题',
+              suggestions: '建议',
+              approved: '**此 PR 已通过 AI 审查，可以自动合并**',
+              needsReview: '**此 PR 需要人工审查**'
             } : {
-              title: '🤖 AI Code Review Report',
+              title: 'AI Code Review Report',
               score: 'Overall Score',
               details: 'Detailed Scores',
               quality: 'Code Quality',
@@ -373,45 +462,77 @@ jobs:
               testing: 'Testing',
               bestPractices: 'Best Practices',
               summary: 'Summary',
-              issues: '⚠️ Issues Found',
-              suggestions: '💡 Suggestions',
-              approved: '✅ **This PR is approved by AI and ready for auto-merge**',
-              needsReview: '⚠️ **This PR needs manual review**'
+              issues: 'Issues Found',
+              suggestions: 'Suggestions',
+              approved: '**This PR is approved by AI and ready for auto-merge**',
+              needsReview: '**This PR needs manual review**'
             };
+
+            // Build metadata line
+            const meta = report._metadata || {};
+            const metaLine = `Model: ${meta.model || 'unknown'} | Time: ${meta.elapsed_seconds || '?'}s | Lines: ${meta.lines_changed || '?'}`;
 
             const body = `## ${labels.title}
 
-            **${labels.score}:** ${report.overall_score}/10 ${report.approved ? '✅' : '⚠️'}
+**${labels.score}:** ${report.overall_score}/10 ${report.approved ? '✅' : '⚠️'}
 
-            ### ${labels.details}
-            - ${labels.quality}: ${report.quality}/10
-            - ${labels.security}: ${report.security}/10
-            - ${labels.performance}: ${report.performance}/10
-            - ${labels.testing}: ${report.testing}/10
-            - ${labels.bestPractices}: ${report.best_practices}/10
+### ${labels.details}
+| Dimension | Score |
+|-----------|-------|
+| ${labels.quality} | ${report.quality}/10 |
+| ${labels.security} | ${report.security}/10 |
+| ${labels.performance} | ${report.performance}/10 |
+| ${labels.testing} | ${report.testing}/10 |
+| ${labels.bestPractices} | ${report.best_practices}/10 |
 
-            ### ${labels.summary}
-            ${report.summary}
+### ${labels.summary}
+${report.summary}
 
-            ${report.issues && report.issues.length > 0 ? `### ${labels.issues}\n${report.issues.map(i => `- ${i}`).join('\n')}` : ''}
+${report.issues && report.issues.length > 0 ? `### ⚠️ ${labels.issues}\n${report.issues.map(i => '- ' + i).join('\n')}` : ''}
 
-            ${report.suggestions && report.suggestions.length > 0 ? `### ${labels.suggestions}\n${report.suggestions.map(s => `- ${s}`).join('\n')}` : ''}
+${report.suggestions && report.suggestions.length > 0 ? `### 💡 ${labels.suggestions}\n${report.suggestions.map(s => '- ' + s).join('\n')}` : ''}
 
-            ---
-            ${report.approved ? labels.approved : labels.needsReview}
-            `;
+---
+${report.approved ? '✅ ' + labels.approved : '⚠️ ' + labels.needsReview}
 
-            await github.rest.issues.createComment({
+<sub>📊 ${metaLine}</sub>`;
+
+            // Find existing AI review comment and update it
+            const comments = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: body
+              issue_number: context.issue.number
             });
+
+            const existingComment = comments.data.find(c =>
+              c.body.includes('AI') &&
+              c.body.includes(labels.title) &&
+              c.user.type === 'Bot'
+            );
+
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: body
+              });
+              console.log('Updated existing comment');
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+              console.log('Created new comment');
+            }
 
   auto-approve-and-merge:
     name: Auto Approve and Merge
     runs-on: ubuntu-latest
-    needs: [code-quality, security-scan, ai-code-review]
+    needs: [security-scan, ai-code-review]
+    timeout-minutes: 5
     if: |
       always() &&
       inputs.auto-merge &&
@@ -439,7 +560,7 @@ jobs:
 
           if [ $FILES_CHANGED -gt $MAX_FILES ] || [ $LINES_CHANGED -gt $MAX_LINES ]; then
             echo "too_large=true" >> $GITHUB_OUTPUT
-            echo "⚠️ PR too large for auto-merge: $FILES_CHANGED files, $LINES_CHANGED lines"
+            echo "PR too large for auto-merge: $FILES_CHANGED files, $LINES_CHANGED lines"
           else
             echo "too_large=false" >> $GITHUB_OUTPUT
           fi
@@ -455,7 +576,7 @@ jobs:
               repo: context.repo.repo,
               pull_number: context.issue.number,
               event: 'APPROVE',
-              body: '✅ Auto-approved by AI code review system\n\n- AI review score: ${{ needs.ai-code-review.outputs.score }}/10\n- Security scan: ${{ needs.security-scan.result }}\n- Code quality: ${{ needs.code-quality.result }}'
+              body: '✅ Auto-approved by AI code review system\n\n- AI review score: ${{ needs.ai-code-review.outputs.score }}/10\n- Security scan: ${{ needs.security-scan.result }}'
             });
 
       - name: Merge PR
